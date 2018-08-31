@@ -8,6 +8,7 @@ const fs           = require('fs-extra');
 const globule      = require('globule');
 const gulp         = require('gulp');
 let log            = require('fancy-log');
+const libnpm       = require('libnpm');
 const path         = require('path');
 const plumber      = require('gulp-plumber');
 const promiseLimit = require('promise-limit');
@@ -645,24 +646,11 @@ async function checkPackages({ skipSecurity } = {}) {
 	// console.log(dependencies);
 	// console.log(tasks);
 
-	const npm = require('npm');
 	const nspAPI = require('nsp/lib/api');
 	const nspConf = {
 		baseUrl: 'https://api.nodesecurity.io'
 	};
 	const limit = promiseLimit(20);
-
-	await new Promise((resolve, reject) => {
-		npm.load({
-			silent: true
-		}, err => {
-			if (err) {
-				reject(err);
-			} else {
-				resolve();
-			}
-		});
-	});
 
 	await Promise.all(tasks.map(task => limit(async () => {
 		const action = task[0];
@@ -747,23 +735,21 @@ async function checkPackages({ skipSecurity } = {}) {
 				break;
 
 			case 'npm info':
-				return new Promise(resolve => {
-					npm.commands.view([ pkg ], true, (err, info) => {
-						if (err) {
-							log(yellow(`npm view failed for ${pkg}@${version}: ${err.message}`));
-						} else {
-							const latest = Object.keys(info)[0];
-							const next = info[latest]['dist-tags'] && info[latest]['dist-tags'].next || null;
-							dependencies[pkg].latest          = latest;
-							dependencies[pkg].latestTimestamp = info[latest].time[latest] || null;
-							dependencies[pkg].next            = next;
-							dependencies[pkg].nextTimestamp   = next && info[latest].time[next] || null;
-							dependencies[pkg].deprecated      = info[latest].deprecated;
-						}
-
-						bar.tick();
-						resolve();
-					});
+				return new Promise(async resolve => {
+					let info = await libnpm.fetch('/appcd');
+					if (!info.ok) {
+						log(yellow(`npm view failed for ${pkg}@${version}: ${await info.text()}`));
+					} else {
+						info = await info.json();
+						const latest = info['dist-tags'] && info['dist-tags'].latest;
+						const next = info['dist-tags'] && info['dist-tags'].next || null;
+						dependencies[pkg].latest          = latest;
+						dependencies[pkg].latestTimestamp = info.time[latest] || null;
+						dependencies[pkg].next            = next;
+						dependencies[pkg].nextTimestamp   = next && info.time[next] || null;
+					}
+					bar.tick();
+					resolve();
 				});
 
 			default:
@@ -1401,72 +1387,55 @@ function dump() {
 
 gulp.task('deps-changelog', cb => {
 	const depmap = getDepMap(true);
-	const npm = require('npm');
 
 	Promise.resolve()
-		.then(() => new Promise((resolve, reject) => {
-			npm.load({
-				silent: true
-			}, err => {
-				if (err) {
-					reject(err);
-				} else {
-					resolve();
-				}
-			});
-		}))
 		.then(() => {
 			return Object.keys(depmap)
 				.reduce((promise, name) => {
-					return promise.then(() => new Promise((resolve, reject) => {
-						npm.commands.view([ name ], true, (err, info) => {
-							if (err) {
-								log(yellow(`npm view failed for ${name}: ${err.message}`));
-							} else {
-								const latestVer = Object.keys(info)[0];
-								const deps = Object.assign({}, info[latestVer].dependencies, info[latestVer].devDependencies);
-								const delta = {};
+					return promise.then(() => new Promise(async (resolve, reject) => {
+						const info = await libnpm.packument(name);
+						const latestVer = info['dist-tags'].latest;
+						const latestVerData = info.versions[latestVer];
+						const deps = Object.assign({}, latestVerData.dependencies, latestVerData.devDependencies);
+						const delta = {};
 
-								for (const [ dep, localDepVer ] of Object.entries(depmap[name].deps)) {
-									if ((deps[dep] && deps[dep] !== localDepVer) || (depmap[dep] && depmap[dep].version !== localDepVer)) {
-										delta[dep] = { from: deps[dep].replace(/[^\d.]/g, ''), to: localDepVer.replace(/[^\d.]/g, '') };
-									}
+						for (const [ dep, localDepVer ] of Object.entries(depmap[name].deps)) {
+							if ((deps[dep] && deps[dep] !== localDepVer) || (depmap[dep] && depmap[dep].version !== localDepVer)) {
+								delta[dep] = { from: deps[dep].replace(/[^\d.]/g, ''), to: localDepVer.replace(/[^\d.]/g, '') };
+							}
+						}
+
+						if (Object.keys(delta).length) {
+							console.log(name);
+							console.log(`  Latest Version; ${latestVer}`);
+							console.log(`  Local Version:  ${depmap[name].version}\n`);
+
+							if (depmap[name].version === latestVer) {
+								console.log('NEEDS VERSION BUMP IN PACKAGE.JSON');
+							}
+							for (const dep of Object.keys(delta).sort()) {
+								if (depmap[dep] && depmap[dep].version.replace(/[^\d.]/g, '') !== delta[dep].to) {
+									console.log(`DEPENDENCY NEEDS VERSION BUMP IN PACKAGE.JSON: ${dep} ${delta[dep].to} -> ${depmap[dep].version}`);
 								}
+							}
+							console.log();
 
-								if (Object.keys(delta).length) {
-									console.log(name);
-									console.log(`  Latest Version; ${latestVer}`);
-									console.log(`  Local Version:  ${depmap[name].version}\n`);
-
-									if (depmap[name].version === latestVer) {
-										console.log('NEEDS VERSION BUMP IN PACKAGE.JSON');
-									}
-									for (const dep of Object.keys(delta).sort()) {
-										if (depmap[dep] && depmap[dep].version.replace(/[^\d.]/g, '') !== delta[dep].to) {
-											console.log(`DEPENDENCY NEEDS VERSION BUMP IN PACKAGE.JSON: ${dep} ${delta[dep].to} -> ${depmap[dep].version}`);
-										}
-									}
-									console.log();
-
-									let change = ' * Updated dependencies:\n';
-									for (const dep of Object.keys(delta).sort()) {
-										const from = delta[dep].from.replace(/[^\d.]/g, '');
-										if (depmap[dep]) {
-											change += `   - ${dep} ${from} -> ${depmap[dep].version}\n`;
-										} else {
-											change += `   - ${dep} ${from} -> ${delta[dep].to}\n`;
-										}
-									}
-
-									const changelog = path.join(__dirname, 'packages', name, 'CHANGELOG.md');
-									if (!fs.existsSync(changelog) || fs.readFileSync(changelog).toString().indexOf(change) === -1) {
-										console.log(`${change}\n\n`);
-									}
+							let change = ' * Updated dependencies:\n';
+							for (const dep of Object.keys(delta).sort()) {
+								const from = delta[dep].from.replace(/[^\d.]/g, '');
+								if (depmap[dep]) {
+									change += `   - ${dep} ${from} -> ${depmap[dep].version}\n`;
+								} else {
+									change += `   - ${dep} ${from} -> ${delta[dep].to}\n`;
 								}
 							}
 
-							resolve();
-						});
+							const changelog = path.join(__dirname, 'packages', name, 'CHANGELOG.md');
+							if (!fs.existsSync(changelog) || fs.readFileSync(changelog).toString().indexOf(change) === -1) {
+								console.log(`${change}\n\n`);
+							}
+						}
+						resolve();
 					}));
 				}, Promise.resolve())
 		})
